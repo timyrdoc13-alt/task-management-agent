@@ -110,9 +110,19 @@ def _h_add_comment(args: dict, ctx: AgentContext, commit: bool) -> dict:
 
 
 def _h_run_research(args: dict, ctx: AgentContext, commit: bool) -> dict:
+    from research import ResearchCancelledError  # noqa: WPS433
+
     emit = ctx.metadata.get("emit_fn")
-    out = run_research(args["topic"], emit=emit)
-    return envelope("success", "research completed", out)
+    should_cancel = ctx.metadata.get("should_cancel_fn")
+    try:
+        out = run_research(
+            args["topic"],
+            emit=emit,
+            should_cancel=should_cancel,
+        )
+        return envelope("success", "research completed", out)
+    except ResearchCancelledError as e:
+        return envelope("error", str(e), error_type="cancelled")
 
 
 def _h_move_card(args: dict, ctx: AgentContext, commit: bool) -> dict:

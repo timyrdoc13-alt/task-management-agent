@@ -820,6 +820,39 @@ def add_comment(card_id: int, text: str) -> dict:
     return envelope("success", f"comment added on #{card_id}", resp)
 
 
+def add_time_log(
+    card_id: int,
+    minutes: int,
+    *,
+    comment: str | None = None,
+    role_id: int | None = None,
+) -> dict:
+    """POST /cards/{id}/time-logs — requires KAITEN_TIMELOG_ROLE_ID in .env."""
+    if minutes < 1 or minutes > 24 * 60:
+        return envelope(
+            "error",
+            "minutes must be 1..1440",
+            error_type="invalid_arguments",
+        )
+    rid = role_id
+    if rid is None:
+        raw = (ENV.get("KAITEN_TIMELOG_ROLE_ID") or "").strip()
+        if not raw.isdigit():
+            return envelope(
+                "error",
+                "KAITEN_TIMELOG_ROLE_ID not set — comment only",
+                error_type="config_error",
+            )
+        rid = int(raw)
+    body: dict[str, Any] = {"role_id": rid, "time_spent": minutes}
+    if comment:
+        body["comment"] = comment[:500]
+    code, resp = http("POST", f"/cards/{card_id}/time-logs", body)
+    if code >= 400:
+        return envelope("error", f"HTTP {code}", resp, error_type="http_error")
+    return envelope("success", f"time log {minutes}m on #{card_id}", resp)
+
+
 def make_delete_token(card_id: int) -> str:
     return "del_" + hmac.new(HMAC_SECRET, str(card_id).encode(), hashlib.sha256).hexdigest()[:10]
 

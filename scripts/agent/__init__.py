@@ -9,6 +9,8 @@ from agent.harness import AgentHarness
 from agent.policy import (
     can_auto_create_card,
     can_auto_research,
+    create_needs_preview,
+    task_always_preview_enabled,
     evaluate_tool,
     research_needs_preview,
 )
@@ -19,6 +21,8 @@ __all__ = [
     "AgentContext",
     "can_auto_create_card",
     "can_auto_research",
+    "create_needs_preview",
+    "task_always_preview_enabled",
     "evaluate_tool",
     "research_needs_preview",
     "run_create_card_workflow",

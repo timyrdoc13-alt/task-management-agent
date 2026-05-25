@@ -19,7 +19,6 @@ import json
 import logging
 import re
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 
@@ -35,13 +34,20 @@ from card_actions import (  # noqa: E402
 from agent import (  # noqa: E402
     AgentContext,
     AgentHarness,
-    can_auto_create_card,
-    can_auto_research,
+    create_needs_preview,
     research_needs_preview,
     run_create_card_workflow,
     run_research_workflow,
 )
-from agent.job_store import get_job_by_key, research_idempotency_key  # noqa: E402
+from agent.job_store import (  # noqa: E402
+    cancel_job,
+    get_job_by_key,
+    get_running_job,
+    research_idempotency_key,
+)
+from agent.types import WorkflowResult  # noqa: E402
+from tg_research_progress import TgResearchProgress  # noqa: E402
+from work_log import apply_work_log, parse_work_log  # noqa: E402
 from agent.pending_store import find_task_preview_by_chat  # noqa: E402
 from agent.pending_store import get as pending_get  # noqa: E402
 from agent.pending_store import pop as pending_pop  # noqa: E402
@@ -103,7 +109,6 @@ ALLOWED_CHATS = {
 AUTO_CARD_MIN = float(ENV.get("AUTO_CARD_MIN_CONFIDENCE", "0.85"))
 AUTO_RESEARCH_MIN = float(ENV.get("AUTO_RESEARCH_MIN_CONFIDENCE", "0.75"))
 AUTO_RESEARCH_ENABLED = (ENV.get("AUTO_RESEARCH_ENABLED", "true").lower() == "true")
-TG_STREAM_EDIT_INTERVAL = float(ENV.get("TG_STREAM_EDIT_INTERVAL_SEC", "1.2"))
 
 if not BOT_TOKEN:
     print("TG_BOT_TOKEN missing in .env", file=sys.stderr)
@@ -235,8 +240,26 @@ async def on_start(msg: Message) -> None:
         "• «что сегодня?» / «что просрочено?»\n"
         "• «изучи monorepo для Next.js 15» — сделаю сам и положу файл в карточку\n"
         "• «сдвинь #64942139 на завтра, P2» — изменить карточку\n"
-        "• «удали #64942139» — удалить (с подтверждением)\n\n"
+        "• «#64942139 сделал интеграцию, 2ч» — комментарий и время в Kaiten\n"
+        "• «удали #64942139» — удалить (с подтверждением)\n"
+        "• /cancel — остановить текущий ресёрч\n\n"
         "Перед созданием задачи покажу черновик — можно править текстом."
+    )
+
+
+@dp.message(Command("cancel"))
+async def on_cancel(msg: Message) -> None:
+    if not _is_allowed(msg):
+        return
+    running = get_running_job(msg.chat.id, "research")
+    if not running:
+        await msg.answer("Нет активного ресёрча в этом чате.")
+        return
+    cancel_job(running["id"])
+    await msg.answer(
+        f"⏹ Запрошена отмена ресёрча.\n"
+        f"Job: <code>{_html_escape(running.get('id', ''))}</code>\n"
+        f"<i>Остановка на ближайшем этапе (поиск/чтение/синтез).</i>"
     )
 
 
@@ -254,7 +277,9 @@ async def on_help(msg: Message) -> None:
         "/report — сводка по задачам за месяц\n"
         "/file — последний файл ресёрча (DOCX)\n"
         "/card 64942139 — показать карточку\n"
+        "/cancel — остановить текущий ресёрч\n"
         "/start — справка\n\n"
+        "Работа по карточке: «#64942139 сделал X, 2 часа» — комментарий + time log\n\n"
         "Изменение карточки (укажи #id):\n"
         "• сдвинь / закрой / в готово\n"
         "• приоритет P1 P2 P3\n"
@@ -450,6 +475,11 @@ async def on_text(msg: Message) -> None:
     text = msg.text.strip()
     await bot.send_chat_action(msg.chat.id, ChatAction.TYPING)
 
+    work_req = parse_work_log(text)
+    if work_req:
+        await _handle_work_log(msg, work_req)
+        return
+
     preview = find_task_preview_by_chat(msg.chat.id)
     if preview and not text.startswith("/"):
         token, pending = preview
@@ -516,10 +546,10 @@ async def on_text(msg: Message) -> None:
 
     if task.intent == "create":
         ctx = _tg_context(msg)
-        if can_auto_create_card(task, ctx):
-            await _create_now(msg, task, ctx)
+        if create_needs_preview(task, ctx):
+            await _send_preview_with_buttons(msg, task)
             return
-        await _send_preview_with_buttons(msg, task)
+        await _create_now(msg, task, ctx)
         return
 
     if task.intent == "update":
@@ -784,127 +814,48 @@ def _spawn_auto_research(chat_id: int, task: ExtractedTask, ctx: AgentContext) -
     asyncio.create_task(_auto_research_message_safe(chat_id, task, ctx))
 
 
-def _truncate_tg_html(text: str, limit: int = 4000) -> str:
-    if len(text) <= limit:
-        return text
-    return text[: limit - 20] + "\n…"
+async def _handle_work_log(msg: Message, req) -> None:
+    ctx = _tg_context(msg)
+    author = str(ctx.metadata.get("display_name") or "Пользователь")
+
+    def _run() -> dict:
+        return apply_work_log(req.card_id, req.summary, author, minutes=req.minutes)
+
+    out = await asyncio.to_thread(_run)
+    if not out.get("ok"):
+        c = out.get("comment") or {}
+        tl = out.get("time_log") or {}
+        err = c.get("summary") or tl.get("summary") or out.get("time_log_skipped_reason")
+        await msg.answer(f"❌ {_html_escape(str(err)[:400])}")
+        return
+    lines = [f"✅ Записал на #{req.card_id}: комментарий"]
+    if req.minutes:
+        tl = out.get("time_log") or {}
+        if tl.get("status") == "success":
+            lines.append(f"⏱ {req.minutes} мин в time log")
+        else:
+            lines.append(
+                f"⏱ время не записано: {_html_escape(tl.get('summary', 'нет role_id')[:120])}"
+            )
+    await msg.answer("\n".join(lines))
 
 
-async def _research_progress_consumer(
+async def _deliver_research_outcome(
     chat_id: int,
-    msg_id: int,
-    aq: asyncio.Queue,
     topic: str,
-    card_line: str,
+    wf: WorkflowResult,
+    *,
+    replay_note: str | None = None,
 ) -> None:
-    header = f"🔄 <b>{_html_escape(topic[:80])}</b>\n{card_line}\n"
-    base = header + "🔍 Старт…"
-    tldr = ""
-    last_edit = 0.0
-    while True:
-        try:
-            ev = await asyncio.wait_for(aq.get(), timeout=900)
-        except asyncio.TimeoutError:
-            continue
-        phase = ev.get("phase")
-        if phase == "done":
-            break
-        if phase == "status":
-            base = header + _html_escape(ev.get("text", ""))
-        elif phase == "tldr_delta":
-            tldr += ev.get("text", "")
-        now = time.time()
-        if phase not in ("status", "tldr_delta"):
-            continue
-        if now - last_edit < TG_STREAM_EDIT_INTERVAL:
-            continue
-        body = base
-        if tldr:
-            body += (
-                f"\n\n<b>Кратко</b>\n<pre>{_html_escape(tldr[-2500:])}</pre>"
-                "\n\n<i>Полный отчёт готовится…</i>"
-            )
-        try:
-            await bot.edit_message_text(_truncate_tg_html(body), chat_id, msg_id)
-        except Exception:
-            pass
-        last_edit = now
-    if tldr:
-        try:
-            await bot.edit_message_text(
-                _truncate_tg_html(
-                    base
-                    + f"\n\n<b>Кратко</b>\n<pre>{_html_escape(tldr[-2500:])}</pre>"
-                    "\n\n<i>Финализирую DOCX и Kaiten…</i>"
-                ),
-                chat_id,
-                msg_id,
-            )
-        except Exception:
-            pass
-
-
-async def _auto_research_message(
-    chat_id: int, task: ExtractedTask, ctx: AgentContext
-) -> None:
-    topic = task.research_topic or task.title
-    idem = research_idempotency_key(chat_id, topic)
-    running = get_job_by_key(idem)
-    if running and running.get("status") == "running":
-        await bot.send_message(
-            chat_id,
-            f"⏳ Ресёрч по этой теме уже выполняется (job {running.get('id')}).",
-        )
-        return
-
-    status_msg = await bot.send_message(
-        chat_id, f"🔄 Стартую ресёрч «{_html_escape(topic[:80])}»…"
-    )
-    msg_id = status_msg.message_id
-    card_line = "Карточка создаётся…"
-
-    loop = asyncio.get_running_loop()
-    progress_q: asyncio.Queue = asyncio.Queue()
-
-    def thread_emit(phase: str, **data) -> None:
-        loop.call_soon_threadsafe(progress_q.put_nowait, {"phase": phase, **data})
-
-    consumer = asyncio.create_task(
-        _research_progress_consumer(chat_id, msg_id, progress_q, topic, card_line)
-    )
-
-    await bot.send_chat_action(chat_id, ChatAction.TYPING)
-
-    def _run():
-        harness = AgentHarness(ctx)
-        harness.ctx.metadata["emit_fn"] = thread_emit
-        return run_research_workflow(
-            harness,
-            task,
-            topic=topic,
-            column_id=_resolve_column_queue(),
-            emit=thread_emit,
-        )
-
-    try:
-        wf = await asyncio.to_thread(_run)
-    except Exception as e:
-        log.exception("research failed")
-        await progress_q.put({"phase": "done"})
-        await consumer
-        await bot.edit_message_text(
-            f"❌ Ресёрч: {_html_escape(str(e)[:500])}", chat_id, msg_id
-        )
-        return
-
-    await progress_q.put({"phase": "done"})
-    await consumer
-
     if wf.status == "error":
+        data = wf.data or {}
+        if data.get("cancelled"):
+            await bot.send_message(chat_id, "⏹ Ресёрч остановлен.")
+            return
         await bot.send_message(chat_id, f"❌ {_html_escape(wf.summary)}")
         return
 
-    data = wf.data
+    data = wf.data or {}
     cid = data.get("card_id")
     url = data.get("url", "")
     meta = data.get("meta") or {}
@@ -928,16 +879,20 @@ async def _auto_research_message(
     else:
         status_line = "📌 Карточка обновлена (без переноса в Готово)."
 
+    header = "🎉 <b>Ресёрч завершён</b>\n\n"
+    if replay_note:
+        header = f"ℹ️ <b>{_html_escape(replay_note)}</b>\n\n" + header
+
     await bot.send_message(
         chat_id,
-        f"🎉 <b>Ресёрч завершён</b>\n\n"
-        f"{status_line}\n"
+        header
+        + f"{status_line}\n"
         f"📎 Результат: <code>{_html_escape(attach_name)}</code> (файл ниже)\n"
         f"<b>Тема:</b> {_html_escape(topic[:80])}\n"
         f"<b>Карточка:</b> #{cid}\n"
         f"<b>Ссылка:</b> {url}\n\n"
         f"📊 Источников: {fetched_n} · ⏱ {meta.get('wall_time_s', 0)}s\n"
-        f"🔖 trace: <code>{_html_escape(wf.trace_id[:16])}</code>",
+        f"🔖 trace: <code>{_html_escape((wf.trace_id or '')[:16])}</code>",
     )
 
     if report_md:
@@ -971,6 +926,98 @@ async def _auto_research_message(
             pass
 
 
+async def _auto_research_message(
+    chat_id: int, task: ExtractedTask, ctx: AgentContext
+) -> None:
+    topic = task.research_topic or task.title
+    idem = research_idempotency_key(chat_id, topic)
+    existing = get_job_by_key(idem)
+    if existing and existing.get("status") == "running":
+        await bot.send_message(
+            chat_id,
+            f"⏳ Ресёрч по этой теме уже выполняется (job {existing.get('id')}). "
+            f"Отмена: /cancel",
+        )
+        return
+    if existing and existing.get("status") == "completed" and existing.get("result"):
+        wf = WorkflowResult(
+            "success",
+            "idempotent replay — job already completed",
+            data=existing["result"],
+            trace_id=existing.get("trace_id", ""),
+        )
+        await _deliver_research_outcome(
+            chat_id,
+            topic,
+            wf,
+            replay_note=(
+                "Этот ресёрч уже был выполнен ранее — отдаю сохранённый результат. "
+                "Чтобы запустить заново, измени формулировку темы."
+            ),
+        )
+        return
+
+    status_msg = await bot.send_message(
+        chat_id, f"🔄 Стартую ресёрч «{_html_escape(topic[:80])}»…"
+    )
+    msg_id = status_msg.message_id
+
+    loop = asyncio.get_running_loop()
+    progress_q: asyncio.Queue = asyncio.Queue()
+
+    def thread_emit(phase: str, **data) -> None:
+        loop.call_soon_threadsafe(progress_q.put_nowait, {"phase": phase, **data})
+
+    progress = TgResearchProgress(
+        bot, chat_id, msg_id, topic, html_escape=_html_escape
+    )
+    consumer = asyncio.create_task(progress.run_consumer(progress_q))
+
+    await bot.send_chat_action(chat_id, ChatAction.TYPING)
+
+    def _run():
+        harness = AgentHarness(ctx)
+        harness.ctx.metadata["emit_fn"] = thread_emit
+        return run_research_workflow(
+            harness,
+            task,
+            topic=topic,
+            column_id=_resolve_column_queue(),
+            emit=thread_emit,
+        )
+
+    try:
+        wf = await asyncio.to_thread(_run)
+    except Exception as e:
+        log.exception("research failed")
+        await progress_q.put({"phase": "done"})
+        await consumer
+        try:
+            await bot.edit_message_text(
+                f"❌ Ресёрч: {_html_escape(str(e)[:500])}", chat_id, msg_id
+            )
+        except Exception as edit_err:
+            log.warning("research error edit failed: %s", edit_err)
+            await bot.send_message(chat_id, f"❌ Ресёрч: {_html_escape(str(e)[:500])}")
+        return
+
+    await progress_q.put({"phase": "done"})
+    await progress.finalize_pin_before_attach()
+    await consumer
+
+    replay = "idempotent replay" in (wf.summary or "").lower()
+    await _deliver_research_outcome(
+        chat_id,
+        topic,
+        wf,
+        replay_note=(
+            "Повторный запуск по той же теме — результат из кэша job."
+            if replay
+            else None
+        ),
+    )
+
+
 async def main() -> None:
     try:
         _BOT_LOCK.acquire()
@@ -979,9 +1026,11 @@ async def main() -> None:
         sys.exit(1)
     log.info("Bot starting. Allowed users: %s chats: %s", ALLOWED_USERS, ALLOWED_CHATS)
     log.info(
-        "Policy: auto_cards=%s auto_research=%s",
+        "Policy: auto_cards=%s always_preview=%s auto_research=%s progress=%s",
         ENV.get("KAITEN_AGENT_AUTO_CARDS"),
+        ENV.get("KAITEN_TASK_ALWAYS_PREVIEW"),
         ENV.get("KAITEN_AGENT_AUTO_RESEARCH", "true"),
+        ENV.get("TG_RESEARCH_PROGRESS_MODE", "steps"),
     )
     try:
         await bot.delete_webhook(drop_pending_updates=False)

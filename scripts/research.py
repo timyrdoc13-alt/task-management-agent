@@ -29,6 +29,10 @@ from llm import (  # noqa: E402
 )
 
 EmitFn = Callable[..., None]
+
+
+class ResearchCancelledError(Exception):
+    """Cooperative cancel from job_store / TG /cancel."""
 from report_export import export_report_files, kaiten_card_description  # noqa: E402
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
@@ -174,6 +178,7 @@ def run_research(
     max_fetches: int | None = None,
     wall_time_s: int | None = None,
     emit: EmitFn | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> dict:
     global MAX_CHARS_PER_PAGE
     MAX_CHARS_PER_PAGE = int(ENV.get("RESEARCH_CHARS_PER_PAGE", "6000"))
@@ -182,6 +187,16 @@ def run_research(
     fetch_workers = int(ENV.get("RESEARCH_FETCH_WORKERS", "4"))
     stream_tldr = ENV.get("RESEARCH_STREAM_TLDR", "true").lower() in {"1", "true", "yes"}
     t0 = time.time()
+
+    def _cancelled() -> bool:
+        try:
+            return bool(should_cancel and should_cancel())
+        except Exception:
+            return False
+
+    if _cancelled():
+        raise ResearchCancelledError("cancelled before start")
+
     _emit(emit, "status", text=f"🔍 Планирую поиск по теме…")
     queries = search_queries_for(topic)
     # Запасной английский запрос, если LLM дал только русские (DDG хуже их парсит)
@@ -195,6 +210,8 @@ def run_research(
     seen_urls: set[str] = set()
     search_backend = "none"
     for q in queries:
+        if _cancelled():
+            raise ResearchCancelledError("cancelled during search")
         if time.time() - t0 > wall_time_s * 0.4:
             break
         results, backend = web_search(q)
@@ -222,6 +239,8 @@ def run_research(
     with ThreadPoolExecutor(max_workers=max(1, fetch_workers)) as pool:
         futures = {pool.submit(fetch_and_extract, c["url"]): c for c in to_fetch}
         for fut in as_completed(futures):
+            if _cancelled():
+                raise ResearchCancelledError("cancelled during fetch")
             if len(fetched) >= max_fetches:
                 break
             if time.time() - t0 > wall_time_s * 0.85:
@@ -275,6 +294,8 @@ def run_research(
         if fetch_errors:
             markdown += "\n\n## Ошибки загрузки\n" + "\n".join(f"- {e}" for e in fetch_errors[:8])
     else:
+        if _cancelled():
+            raise ResearchCancelledError("cancelled before synthesis")
         if two_pass:
             _emit(emit, "status", text=f"🧠 Извлекаю факты из {len(fetched)} источников…")
             facts = extract_research_facts(topic, fetched)

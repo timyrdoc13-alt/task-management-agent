@@ -163,3 +163,44 @@ def research_idempotency_key(chat_id: int, topic: str) -> str:
 
     digest = hashlib.sha256(topic.strip().lower().encode()).hexdigest()[:16]
     return f"research:{chat_id}:{digest}"
+
+
+def get_running_job(
+    chat_id: int,
+    job_type: str = "research",
+) -> dict[str, Any] | None:
+    with _db() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM jobs
+            WHERE chat_id = ? AND job_type = ? AND status = 'running'
+            ORDER BY updated_at DESC LIMIT 1
+            """,
+            (chat_id, job_type),
+        ).fetchone()
+    return _row_to_dict(row) if row else None
+
+
+def cancel_job(job_id: str) -> dict[str, Any] | None:
+    """Mark running job cancelled (cooperative — workflow checks status)."""
+    job = get_job(job_id)
+    if not job:
+        return None
+    if job.get("status") != "running":
+        return job
+    update_job(job_id, status="cancelled", error="cancelled by user")
+    return get_job(job_id)
+
+
+def cancel_job_by_key(idempotency_key: str) -> dict[str, Any] | None:
+    job = get_job_by_key(idempotency_key)
+    if not job:
+        return None
+    if job.get("status") != "running":
+        return job
+    return cancel_job(job["id"])
+
+
+def is_job_cancelled(job_id: str) -> bool:
+    job = get_job(job_id)
+    return bool(job and job.get("status") == "cancelled")

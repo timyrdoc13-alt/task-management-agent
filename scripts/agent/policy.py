@@ -35,6 +35,19 @@ def auto_cards_enabled() -> bool:
     return _truthy("KAITEN_AGENT_AUTO_CARDS", "false")
 
 
+def task_always_preview_enabled() -> bool:
+    """Force TG preview+revision for every create (overrides auto_cards)."""
+    return _truthy("KAITEN_TASK_ALWAYS_PREVIEW", "false")
+
+
+def create_needs_preview(task: ExtractedTask, ctx: AgentContext) -> bool:
+    if ctx.channel != "telegram":
+        return True
+    if task_always_preview_enabled():
+        return True
+    return not can_auto_create_card(task, ctx)
+
+
 def channel_requires_approval(ctx: AgentContext) -> bool:
     """Cursor/CLI: writes need explicit commit unless already approved."""
     return ctx.channel in {"cursor", "cli"}

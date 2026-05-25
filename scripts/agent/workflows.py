@@ -9,7 +9,12 @@ from typing import Any, Callable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agent.harness import AgentHarness  # noqa: E402
-from agent.job_store import create_job, research_idempotency_key, update_job  # noqa: E402
+from agent.job_store import (  # noqa: E402
+    create_job,
+    is_job_cancelled,
+    research_idempotency_key,
+    update_job,
+)
 from agent.types import AgentContext, WorkflowResult  # noqa: E402
 from agent.validation import validate_research_report  # noqa: E402
 from kaiten_api import ENV  # noqa: E402
@@ -121,6 +126,7 @@ def run_research_workflow(
     update_job(job_id, status="running")
 
     harness.ctx.metadata["emit_fn"] = emit
+    harness.ctx.metadata["should_cancel_fn"] = lambda: is_job_cancelled(job_id)
     initial_desc = kaiten_description(task) or (
         f"## Тема\n{topic}\n\n## Definition of done\nОтчёт DOCX во вложениях."
     )
@@ -168,15 +174,25 @@ def run_research_workflow(
 
     research = harness.execute_tool("run_research", {"topic": topic}, commit=True)
     if research.get("status") != "success":
+        err_type = research.get("error_type")
+        summary = research.get("summary", "research failed")
+        if err_type == "cancelled":
+            update_job(job_id, status="cancelled", error=summary)
+            return WorkflowResult(
+                "error",
+                "research cancelled",
+                data={"card_id": cid, "url": url, "cancelled": True},
+                steps=harness.steps,
+            )
         harness.execute_tool(
             "add_comment",
-            {"card_id": cid, "text": f"❌ Ресёрч: {research.get('summary', '')[:400]}"},
+            {"card_id": cid, "text": f"❌ Ресёрч: {summary[:400]}"},
             commit=True,
         )
-        update_job(job_id, status="failed", error=research.get("summary"))
+        update_job(job_id, status="failed", error=summary)
         return WorkflowResult(
             "error",
-            research.get("summary", "research failed"),
+            summary,
             data={"card_id": cid, "url": url},
             steps=harness.steps,
         )
