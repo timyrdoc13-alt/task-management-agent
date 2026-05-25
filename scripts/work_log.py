@@ -40,6 +40,29 @@ def parse_duration_minutes(text: str) -> int | None:
     return max(1, int(round(val)))
 
 
+def parse_log_command(text: str) -> WorkLogRequest | None:
+    """Parse /log #64942144 2ч провели мит or /log 64942144 текст."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    if raw.lower().startswith("/log"):
+        raw = raw[4:].strip()
+    if not raw:
+        return None
+    cid = parse_card_id(raw)
+    if not cid:
+        return None
+    summary = raw
+    summary = re.sub(r"#\d{5,10}\b", "", summary)
+    summary = re.sub(r"\b\d{7,10}\b", "", summary, count=1)
+    summary = _TIME.sub("", summary)
+    summary = re.sub(r"\s+", " ", summary).strip(" ,.—")
+    if len(summary) < 3:
+        summary = "Работа по задаче (TG /log)"
+    minutes = parse_duration_minutes(raw)
+    return WorkLogRequest(card_id=cid, summary=summary[:500], minutes=minutes)
+
+
 def parse_work_log(text: str) -> WorkLogRequest | None:
     """#12345 сделал X, 2ч — comment + optional time log."""
     raw = (text or "").strip()
@@ -87,15 +110,16 @@ def apply_work_log(
     text = format_work_comment(author, summary, minutes)
     comment_res = add_comment(card_id, text)
     out: dict = {"comment": comment_res, "card_id": card_id}
-    if comment_res.get("status") != "success":
+    comment_ok = comment_res.get("status") == "success"
+    out["comment_ok"] = comment_ok
+    if not comment_ok:
         out["ok"] = False
         return out
+    out["ok"] = True
     if minutes:
         tl = add_time_log(card_id, minutes, comment=summary[:500])
         out["time_log"] = tl
-        out["ok"] = tl.get("status") == "success"
+        out["time_log_ok"] = tl.get("status") == "success"
         if tl.get("status") != "success":
             out["time_log_skipped_reason"] = tl.get("summary", "")
-    else:
-        out["ok"] = True
     return out

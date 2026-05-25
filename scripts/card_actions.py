@@ -94,11 +94,84 @@ column_target: очередь/inbox=очередь, в работе/wip/код=w
 
 
 def parse_card_id(text: str) -> int | None:
+    m = re.search(
+        r"kaiten(?:\.[\w-]+)?/(?:c/)?(\d{5,10})\b",
+        text,
+        re.I,
+    )
+    if m:
+        return int(m.group(1))
     m = re.search(r"(?:#|карточк[аеи]\s*|card\s*)(\d{5,10})\b", text, re.I)
     if m:
         return int(m.group(1))
     m = re.search(r"\b(\d{7,10})\b", text)
     return int(m.group(1)) if m else None
+
+
+_EXPLICIT_CARD_CMD = re.compile(
+    r"(?:"
+    r"\b(?:удали|удалить|снеси|убери\s+карточку)\b|"
+    r"\b(?:закрой|закрыть|перенеси\s+в\s+готово)\b|"
+    r"\b(?:перенеси|сдвинь|поставь|перемести)\b(?:\s+\S+){0,6}?\s+"
+    r"(?:в|на)\s+(?:очеред|wip|готово|работ|написан|колонк)|"
+    r"\b(?:перенеси|сдвинь|поставь|перемести)\s+(?:в|на)\b|"
+    r"(?:^|\s)(?:wip|очередь)(?:\s|$|[,.!?])|"
+    r"\b(?:приоритет|срочн|P[123])\b|"
+    r"\b(?:убери|сними|без)\s+дедлайн|"
+    r"\b(?:дедлайн|due|срок)\b|"
+    r"\b(?:завтра|сегодня)\b.*(?:дедлайн|срок|due)|"
+    r"\b(?:переименуй|описание|заголовок)\b"
+    r")",
+    re.I | re.U,
+)
+
+_STATUS_NARRATIVE = re.compile(
+    r"(?:"
+    r"\b(?:отдал[иа]?|передал[иа]?|ушл[ао]|попал[ао]?|перевел[иа]?|отправил[иа]?)\b"
+    r".{0,40}?(?:работ|wip|очеред|готово|написан)|"
+    r"\bв\s+работ[уе]\b|"
+    r"\b(?:на\s+)?(?:написани[ея]|ревью)\b|"
+    r"\b(?:в|на)\s+(?:очеред|wip|готово)\b"
+    r")",
+    re.I | re.U,
+)
+
+
+def is_explicit_card_command(text: str) -> bool:
+    """True when user clearly requests a card edit (not status narrative only)."""
+    return bool(_EXPLICIT_CARD_CMD.search(text or ""))
+
+
+def has_status_narrative(text: str, card_id: int | None) -> bool:
+    """Status/column story with card id but no explicit edit imperative."""
+    if not card_id:
+        return False
+    return bool(_STATUS_NARRATIVE.search(text or ""))
+
+
+def strip_card_references(text: str, card_id: int | None = None) -> str:
+    """Remove card id, Kaiten URLs, and markdown links — leave user narrative."""
+    s = text or ""
+    s = re.sub(
+        r"https?://[^\s)]*kaiten[^\s)]*/(?:c/)?\d{5,10}\b",
+        "",
+        s,
+        flags=re.I,
+    )
+    s = re.sub(r"\(https?://[^\)]+\)", "", s)
+    s = re.sub(r"#\d{5,10}\b", "", s)
+    if card_id:
+        s = re.sub(rf"\b{card_id}\b", "", s, count=1)
+    s = re.sub(r"\b(?:карточк[аеи]|card)\s*", "", s, flags=re.I)
+    s = re.sub(r"\s+", " ", s).strip(" ,.—-")
+    return s
+
+
+def should_offer_card_choice(text: str, card_id: int | None) -> bool:
+    """Card id + free-text update without explicit edit command → TG buttons (U1)."""
+    if not card_id or is_explicit_card_command(text):
+        return False
+    return len(strip_card_references(text, card_id)) >= 3
 
 
 def _regex_guess_action(text: str) -> CardAction | None:
@@ -116,12 +189,19 @@ def _regex_guess_action(text: str) -> CardAction | None:
         act.action = "close"
         act.column_target = "готово"
         primary = "close"
-    elif re.search(r"\b(очеред|wip|в\s+работ|написание)\b", low):
+    elif re.search(
+        r"\b(?:перенеси|сдвинь|поставь|перемести)\b.*(?:очеред|wip|готово|написан|колонк|работ)",
+        low,
+    ) or re.search(r"(?:^|\s)(?:wip|очередь)(?:\s|$|[,.!?])", low):
         act.action = "move_column"
         if "очеред" in low:
             act.column_target = "очередь"
-        elif "wip" in low or "работ" in low or "написан" in low:
+        elif re.search(r"\b(?:wip|написан)\b", low) or re.search(
+            r"\b(?:перенеси|сдвинь|поставь|перемести)\b.*\bработ", low
+        ):
             act.column_target = "wip"
+        elif "готово" in low:
+            act.column_target = "готово"
         primary = "move_column"
 
     pr_m = re.search(r"\b(P[123])\b", text, re.I)
@@ -272,10 +352,25 @@ def build_action_plan(action: CardAction, harness: AgentHarness | None = None) -
         elif action.due_date_iso or action.action == "set_due":
             ops.append(f"Дедлайн → {action.due_date_iso}")
             patch_preview["due_date"] = action.due_date_iso
-        if action.column_target or action.action == "move_column":
+        if action.column_target or action.action in ("move_column", "close"):
             col_id, label = column_id_for_target(action.column_target or "готово")
             if not col_id:
                 return {"ok": False, "error": f"Не понял колонку: {action.column_target}"}
+            current_col = card.get("column_id")
+            if current_col is not None and int(current_col) == int(col_id):
+                title = _column_title(col_id)
+                return {
+                    "ok": True,
+                    "noop": True,
+                    "message": f"Карточка #{action.card_id} уже в колонке «{title}».",
+                    "card_id": action.card_id,
+                    "card_title": card.get("title", ""),
+                    "card_url": f"{ENV.get('KAITEN_BASE_URL', '').rstrip('/')}/{action.card_id}",
+                    "column_now": title,
+                    "ops": [],
+                    "patch_preview": {},
+                    "action": action.action,
+                }
             ops.append(f"Колонка → «{_column_title(col_id)}» ({label})")
             patch_preview["column_id"] = col_id
         if action.title or action.action == "set_title":

@@ -30,6 +30,7 @@ from card_actions import (  # noqa: E402
     build_action_plan,
     extract_card_action,
     parse_card_id,
+    should_offer_card_choice,
 )
 from agent import (  # noqa: E402
     AgentContext,
@@ -47,7 +48,7 @@ from agent.job_store import (  # noqa: E402
 )
 from agent.types import WorkflowResult  # noqa: E402
 from tg_research_progress import TgResearchProgress  # noqa: E402
-from work_log import apply_work_log, parse_work_log  # noqa: E402
+from work_log import apply_work_log, parse_log_command, parse_work_log  # noqa: E402
 from agent.pending_store import find_task_preview_by_chat  # noqa: E402
 from agent.pending_store import get as pending_get  # noqa: E402
 from agent.pending_store import pop as pending_pop  # noqa: E402
@@ -190,6 +191,25 @@ def _preview_kb(token: str, *, delete: bool = False) -> InlineKeyboardMarkup:
     )
 
 
+def _card_choice_kb(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="💬 Комментарий", callback_data=f"cact:c:{token}"
+                ),
+                InlineKeyboardButton(text="⏱ Время", callback_data=f"cact:t:{token}"),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✏ Изменить карточку", callback_data=f"cact:e:{token}"
+                ),
+                InlineKeyboardButton(text="❌ Отмена", callback_data=f"cact:n:{token}"),
+            ],
+        ]
+    )
+
+
 def _tg_context(msg: Message | CallbackQuery) -> AgentContext:
     user = msg.from_user
     chat = msg.chat if isinstance(msg, Message) else msg.message.chat
@@ -241,6 +261,7 @@ async def on_start(msg: Message) -> None:
         "• «изучи monorepo для Next.js 15» — сделаю сам и положу файл в карточку\n"
         "• «сдвинь #64942139 на завтра, P2» — изменить карточку\n"
         "• «#64942139 сделал интеграцию, 2ч» — комментарий и время в Kaiten\n"
+        "• /log #64942139 2ч мит — явная запись времени и комментария\n"
         "• «удали #64942139» — удалить (с подтверждением)\n"
         "• /cancel — остановить текущий ресёрч\n\n"
         "Перед созданием задачи покажу черновик — можно править текстом."
@@ -277,9 +298,10 @@ async def on_help(msg: Message) -> None:
         "/report — сводка по задачам за месяц\n"
         "/file — последний файл ресёрча (DOCX)\n"
         "/card 64942139 — показать карточку\n"
+        "/log #64942139 2ч текст — комментарий + time log (без глаголов «сделал»)\n"
         "/cancel — остановить текущий ресёрч\n"
         "/start — справка\n\n"
-        "Работа по карточке: «#64942139 сделал X, 2 часа» — комментарий + time log\n\n"
+        "Работа по карточке: «#64942139 сделал X, 2 часа» или /log #id 2ч текст\n\n"
         "Изменение карточки (укажи #id):\n"
         "• сдвинь / закрой / в готово\n"
         "• приоритет P1 P2 P3\n"
@@ -441,6 +463,20 @@ async def on_overdue(msg: Message) -> None:
     await _send_task_list(msg, "overdue")
 
 
+@dp.message(Command("log"))
+async def on_log_cmd(msg: Message) -> None:
+    if not _is_allowed(msg):
+        return
+    req = parse_log_command(msg.text or "")
+    if not req:
+        await msg.answer(
+            "Использование: <code>/log #64942144 2ч провели мит</code> "
+            "или <code>/log 64942144 текст</code>"
+        )
+        return
+    await _handle_work_log(msg, req)
+
+
 @dp.message(Command("card"))
 async def on_card_cmd(msg: Message) -> None:
     if not _is_allowed(msg):
@@ -499,8 +535,27 @@ async def on_text(msg: Message) -> None:
         await msg.answer(body, reply_markup=_preview_kb(token))
         return
 
+    card_id = parse_card_id(text)
+    if card_id and should_offer_card_choice(text, card_id):
+        token = _approval_token()
+        pending_put(
+            token,
+            {
+                "kind": "card_choice",
+                "card_id": card_id,
+                "text": text,
+                "chat_id": msg.chat.id,
+            },
+        )
+        await msg.answer(
+            f"Карточка <b>#{card_id}</b> — что сделать с сообщением?\n"
+            f"<i>{_html_escape(text[:200])}</i>",
+            reply_markup=_card_choice_kb(token),
+        )
+        return
+
     # Изменение / удаление карточки (приоритет над create/research)
-    if _CARD_OP_HINT.search(text) or parse_card_id(text):
+    if _CARD_OP_HINT.search(text) or card_id:
         card_action = await asyncio.to_thread(extract_card_action, text)
         if card_action.action != "none" and card_action.card_id:
             await _handle_card_action(msg, card_action)
@@ -573,6 +628,9 @@ async def _handle_card_action(msg: Message, action: CardAction) -> None:
     plan = await asyncio.to_thread(_plan)
     if not plan.get("ok"):
         await msg.answer(f"❌ {_html_escape(plan.get('error', 'ошибка'))}")
+        return
+    if plan.get("noop"):
+        await msg.answer(f"ℹ️ {_html_escape(plan.get('message', 'Без изменений'))}")
         return
 
     token = _approval_token()
@@ -783,6 +841,116 @@ async def on_no(cq: CallbackQuery) -> None:
         pass
 
 
+@dp.callback_query(F.data.startswith("cact:"))
+async def on_card_choice(cq: CallbackQuery) -> None:
+    if not _is_allowed(cq):
+        return
+    parts = (cq.data or "").split(":")
+    if len(parts) < 3:
+        await cq.answer("Неверная кнопка.", show_alert=True)
+        return
+    action_key, token = parts[1], parts[2]
+    if action_key == "n":
+        pending_pop(token)
+        await cq.answer("Отменено.")
+        try:
+            await cq.message.edit_reply_markup()
+        except Exception:
+            pass
+        return
+
+    p = pending_get(token)
+    if not p or p.get("kind") != "card_choice":
+        await cq.answer("Превью устарело, повтори.", show_alert=True)
+        return
+
+    chat_id = p["chat_id"]
+    card_id = int(p["card_id"])
+    stored_text = p.get("text") or ""
+    pending_pop(token)
+    try:
+        await cq.message.edit_reply_markup()
+    except Exception:
+        pass
+
+    ctx = _tg_context(cq)
+    author = str(ctx.metadata.get("display_name") or "Пользователь")
+
+    if action_key == "c":
+        await cq.answer("Комментарий...")
+        summary = stored_text.strip()
+        if len(summary) < 3:
+            summary = "Обновление (Telegram)"
+        out = await asyncio.to_thread(
+            apply_work_log, card_id, summary[:500], author, minutes=None
+        )
+        if not out.get("ok"):
+            err = (out.get("comment") or {}).get("summary", "ошибка")
+            await bot.send_message(chat_id, f"❌ {_html_escape(str(err)[:400])}")
+            return
+        await bot.send_message(chat_id, f"✅ Комментарий на #{card_id}")
+        return
+
+    if action_key == "t":
+        from work_log import parse_duration_minutes
+
+        minutes = parse_duration_minutes(stored_text)
+        if not minutes:
+            await cq.answer("Укажи длительность", show_alert=True)
+            await bot.send_message(
+                chat_id,
+                "⏱ Не нашёл длительность в тексте. Пример: "
+                "<code>/log #64942144 2ч провели мит</code>",
+            )
+            return
+        await cq.answer("Время...")
+        summary = re.sub(
+            r"(\d+(?:[.,]\d+)?)\s*(?:час(?:а|ов)?|ч\b|h\b|мин(?:ут(?:ы)?)?|m\b)",
+            "",
+            stored_text,
+            flags=re.I,
+        )
+        summary = re.sub(r"#\d{5,10}\b", "", summary)
+        summary = re.sub(r"\b\d{7,10}\b", "", summary, count=1)
+        summary = re.sub(r"\s+", " ", summary).strip(" ,.—")
+        if len(summary) < 3:
+            summary = "Работа по задаче (TG)"
+        out = await asyncio.to_thread(
+            apply_work_log, card_id, summary[:500], author, minutes=minutes
+        )
+        lines = [f"✅ Записал на #{card_id}: комментарий"]
+        if out.get("time_log_ok"):
+            lines.append(f"⏱ {minutes} мин в time log")
+        elif out.get("time_log") is not None:
+            tl = out.get("time_log") or {}
+            lines.append(
+                f"⚠ время не записано: {_html_escape(tl.get('summary', 'нет role_id')[:120])}"
+            )
+        if not out.get("ok"):
+            err = (out.get("comment") or {}).get("summary", "ошибка")
+            await bot.send_message(chat_id, f"❌ {_html_escape(str(err)[:400])}")
+            return
+        await bot.send_message(chat_id, "\n".join(lines))
+        return
+
+    if action_key == "e":
+        await cq.answer("Изменение...")
+        card_action = await asyncio.to_thread(extract_card_action, stored_text)
+        if card_action.action == "none" or not card_action.card_id:
+            await bot.send_message(
+                chat_id,
+                "✏ Не понял изменение. Пример: "
+                "<code>перенеси #64942139 в готово</code>",
+            )
+            return
+        msg = cq.message
+        if msg:
+            await _handle_card_action(msg, card_action)
+        return
+
+    await cq.answer("Неизвестное действие.", show_alert=True)
+
+
 async def _create_now_chat(chat_id: int, task: ExtractedTask, ctx: AgentContext) -> None:
     def _run():
         harness = AgentHarness(ctx)
@@ -824,18 +992,17 @@ async def _handle_work_log(msg: Message, req) -> None:
     out = await asyncio.to_thread(_run)
     if not out.get("ok"):
         c = out.get("comment") or {}
-        tl = out.get("time_log") or {}
-        err = c.get("summary") or tl.get("summary") or out.get("time_log_skipped_reason")
+        err = c.get("summary") or "ошибка комментария"
         await msg.answer(f"❌ {_html_escape(str(err)[:400])}")
         return
     lines = [f"✅ Записал на #{req.card_id}: комментарий"]
     if req.minutes:
-        tl = out.get("time_log") or {}
-        if tl.get("status") == "success":
+        if out.get("time_log_ok"):
             lines.append(f"⏱ {req.minutes} мин в time log")
-        else:
+        elif out.get("time_log") is not None:
+            tl = out.get("time_log") or {}
             lines.append(
-                f"⏱ время не записано: {_html_escape(tl.get('summary', 'нет role_id')[:120])}"
+                f"⚠ время не записано: {_html_escape(tl.get('summary', 'нет role_id')[:120])}"
             )
     await msg.answer("\n".join(lines))
 
