@@ -1,0 +1,35 @@
+# Telegram ↔ Kaiten. role: editor = полный доступ к боту (как у владельца).
+users:
+  - telegram_id: 228378111
+    kaiten_user_id: 594738
+    username: timyr_doc
+    display_name: Тимур Ильинчик
+    role: editor
+    aliases: [тимур, ильинчик, timur]
+
+  - telegram_id: 458002471
+    kaiten_user_id: 1030973
+    username: YA_Podkopaev
+    display_name: Ян Подкопаев
+    role: editor
+    aliases: [ян, яну, яна, подкопаев, podkopaev, ya_podkopaev]
+
+  - telegram_id: 522378116
+    kaiten_user_id: 1030974
+    username: VA_Minko
+    display_name: Минько Владислав
+    role: editor
+    aliases: [владислав, минько, minko, va_minko, мінько]
+
+  - telegram_id: 773060772
+    kaiten_user_id: 1030975
+    username: KA_Kotova
+    display_name: Ксения Котова
+    role: editor
+    aliases: [ксения, котова, ksenia, ka_kotova]
+
+  # Для назначения по имени в тексте (без доступа к боту, пока нет telegram_id):
+  - kaiten_user_id: 635192
+    username: lexa_klav
+    display_name: Алексей Черепанов
+    aliases: [алексей, лёша, леша, черепанов, lexa]

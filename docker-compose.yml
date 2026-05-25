@@ -1,0 +1,32 @@
+# Kaiten Telegram bot — production on VPS
+# Usage:
+#   cp .env.example .env   # fill secrets (or scp .env from Mac)
+#   docker compose up -d --build
+#   docker compose logs -f kaiten-bot
+
+services:
+  kaiten-bot:
+    build: .
+    image: kaiten-agent-bot:latest
+    container_name: kaiten-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: Europe/Moscow
+      KAITEN_RUNTIME_DIR: /data/runtime
+      KAITEN_ARTIFACTS_DIR: /data/artifacts
+    volumes:
+      - kaiten-runtime:/data/runtime
+      - kaiten-artifacts:/data/artifacts
+      # обновлять пользователей TG без пересборки образа:
+      - ./config/telegram_users.yaml:/app/config/telegram_users.yaml:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  kaiten-runtime:
+  kaiten-artifacts:

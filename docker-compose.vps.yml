@@ -1,0 +1,30 @@
+# VPS: образ из docker load, сеть как у хоста (обход проблем bridge/IPv6)
+#   docker compose -f docker-compose.vps.yml up -d --no-build --pull never
+
+services:
+  kaiten-bot:
+    image: kaiten-agent-bot:latest
+    container_name: kaiten-bot
+    network_mode: host
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: Europe/Moscow
+      KAITEN_RUNTIME_DIR: /data/runtime
+      KAITEN_ARTIFACTS_DIR: /data/artifacts
+    volumes:
+      - kaiten-runtime:/data/runtime
+      - kaiten-artifacts:/data/artifacts
+      - ./config/telegram_users.yaml:/app/config/telegram_users.yaml:ro
+      # llm.py читает /app/.env; env_file в compose недостаточен без mount (см. load_env в kaiten_api)
+      - ./.env:/app/.env:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  kaiten-runtime:
+  kaiten-artifacts:

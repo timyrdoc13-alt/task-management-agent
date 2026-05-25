@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.kaiten-agent.bot</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/timurilincik/.cursor/skills/kaiten-task-agent/.venv/bin/python3</string>
+    <string>/Users/timurilincik/.cursor/skills/kaiten-task-agent/scripts/bot.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/timurilincik/.cursor/skills/kaiten-task-agent</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    <key>LANG</key><string>ru_RU.UTF-8</string>
+    <key>LC_ALL</key><string>ru_RU.UTF-8</string>
+  </dict>
+
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>Crashed</key><true/>
+    <key>SuccessfulExit</key><false/>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/Users/timurilincik/Library/Logs/kaiten-agent/bot.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/timurilincik/Library/Logs/kaiten-agent/bot.stderr.log</string>
+</dict>
+</plist>
