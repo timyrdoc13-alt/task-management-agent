@@ -6,7 +6,7 @@ import html
 import re
 from typing import Any
 
-from kaiten_api import ENV, list_active_cards, list_overdue, list_today
+from kaiten_api import ENV, board_column_config, list_active_cards, list_overdue, list_today
 
 
 def _esc(s: str) -> str:
@@ -120,7 +120,10 @@ def render_digest(harness=None) -> str:
             parts.append(render_active_board(data))
             return "\n".join(parts).strip()
         if n and parts:
-            parts.append(f"\n📌 <b>На доске (очередь + WIP): {n}</b>")
+            cols = board_column_config()
+            q = (cols.get("queue") or {}).get("title") or "Очередь"
+            w = (cols.get("wip") or {}).get("title") or "В работе"
+            parts.append(f"\n📌 <b>На доске («{q}» + «{w}»): {n}</b>")
             for g in groups:
                 for c in (g.get("cards") or [])[:5]:
                     parts.append(_format_card_line(c))
@@ -191,7 +194,10 @@ def render_digest_via_harness(harness) -> str:
             parts.append(render_active_board(data))
             return "\n".join(parts).strip()
         if n and parts:
-            parts.append(f"\n📌 <b>На доске (очередь + WIP): {n}</b>")
+            cols = board_column_config()
+            q = (cols.get("queue") or {}).get("title") or "Очередь"
+            w = (cols.get("wip") or {}).get("title") or "В работе"
+            parts.append(f"\n📌 <b>На доске («{q}» + «{w}»): {n}</b>")
             for g in groups:
                 for c in (g.get("cards") or [])[:5]:
                     parts.append(_format_card_line(c))

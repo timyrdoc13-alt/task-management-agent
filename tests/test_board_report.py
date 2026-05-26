@@ -1,4 +1,10 @@
-from board_report import _column_key, build_board_report, format_board_report_html, parse_board_report_period
+from board_report import (
+    _column_key,
+    build_board_report,
+    format_board_report_html,
+    format_column_snapshot_lines,
+    parse_board_report_period,
+)
 
 
 def test_parse_period_month():
@@ -16,8 +22,18 @@ def test_format_report_smoke():
     stats = build_board_report()
     text = format_board_report_html(stats)
     assert "Отчёт по задачам" in text
-    assert "Новых:" in text
+    assert "Поступило (новых)" in text
     assert "На стопе" in text
+    assert "Сейчас на доске" in text
+
+
+def test_format_column_snapshot_uses_kaiten_titles():
+    lines = format_column_snapshot_lines({6128316: 2, 6128807: 1})
+    text = "\n".join(lines)
+    assert "В работе · Ревью" in text or "Ревью" in text
+    assert "Готово к защите" in text
+    assert "WIP" not in text
+    assert "blocked" not in text.lower()
 
 
 def test_column_key_matches_wip_subcolumn():

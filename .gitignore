@@ -9,3 +9,5 @@ logs/
 scripts/agent/__pycache__/
 *.tar
 *.tar.gz
+*.bundle
+kaiten-agent.bundle

@@ -340,6 +340,13 @@ def list_cards(
         updated_dt = _parse_api_dt(c.get("updated"))
         completed_dt = _parse_api_dt(c.get("completed_at"))
         col_changed_dt = _parse_api_dt(c.get("column_changed_at"))
+        members = c.get("members") or []
+        responsible_ids = [
+            int(m["user_id"])
+            for m in members
+            if m.get("type") == 2 and m.get("user_id") is not None
+        ]
+        owner_id = c.get("owner_id")
         items.append(
             {
                 "id": c["id"],
@@ -350,6 +357,8 @@ def list_cards(
                 "state": c.get("state"),
                 "archived": bool(c.get("archived")),
                 "blocked": bool(c.get("blocked")),
+                "owner_id": int(owner_id) if owner_id is not None else None,
+                "responsible_user_ids": responsible_ids,
                 "created": created_dt.isoformat(timespec="seconds") if created_dt else None,
                 "updated": updated_dt.isoformat(timespec="seconds") if updated_dt else None,
                 "completed_at": completed_dt.isoformat(timespec="seconds")
@@ -464,6 +473,62 @@ def _column_tree_entry(column_id: int, tree: list[dict[str, Any]]) -> dict[str, 
     return None
 
 
+def board_columns_display_list(board_id: int | None = None) -> list[dict[str, Any]]:
+    """Колонки доски в порядке Kaiten: id, title, depth (0 = корень)."""
+    tree = fetch_board_columns_tree(board_id)
+    out: list[dict[str, Any]] = []
+
+    def walk(nodes: list[dict[str, Any]], depth: int = 0) -> None:
+        for col in nodes or []:
+            cid = col.get("id")
+            if cid is None:
+                continue
+            out.append(
+                {
+                    "id": int(cid),
+                    "title": (col.get("title") or "").strip(),
+                    "depth": depth,
+                }
+            )
+            walk(col.get("subcolumns") or [], depth + 1)
+
+    walk(tree)
+    return out
+
+
+def board_columns_for_report(board_id: int | None = None) -> list[dict[str, Any]]:
+    """Колонки для отчётов: только листья; подколонки — «Родитель · Подколонка»."""
+    tree = fetch_board_columns_tree(board_id)
+    out: list[dict[str, Any]] = []
+
+    def walk(nodes: list[dict[str, Any]], parent_title: str | None = None) -> None:
+        for col in nodes or []:
+            cid = col.get("id")
+            if cid is None:
+                continue
+            title = (col.get("title") or "").strip()
+            subs = col.get("subcolumns") or []
+            if subs:
+                walk(subs, title)
+            else:
+                if not parent_title or parent_title.casefold() == title.casefold():
+                    label = title
+                else:
+                    label = f"{parent_title} · {title}"
+                out.append({"id": int(cid), "title": title, "label": label})
+
+    walk(tree)
+    return out
+
+
+def column_labels_for_report(board_id: int | None = None) -> dict[int, str]:
+    return {c["id"]: c["label"] for c in board_columns_for_report(board_id)}
+
+
+def column_titles_by_id(board_id: int | None = None) -> dict[int, str]:
+    return {c["id"]: c["title"] for c in board_columns_display_list(board_id)}
+
+
 def _expand_column_ids(primary_id: int, tree: list[dict[str, Any]]) -> list[int]:
     """Parent column id + all subcolumn ids (cards often live in subcolumns only)."""
     ids = [primary_id]
@@ -503,7 +568,7 @@ def board_column_config() -> dict[str, dict[str, Any]]:
     Each bucket has column_ids (all ids that count for reports/filters) and
     column_id (primary id used for move_card — leaf subcolumn when applicable).
     """
-    labels = {
+    fallback_labels = {
         "queue": "Очередь",
         "wip": "В работе",
         "done": "Готово",
@@ -515,11 +580,13 @@ def board_column_config() -> dict[str, dict[str, Any]]:
     }
     tree = fetch_board_columns_tree()
     out: dict[str, dict[str, Any]] = {}
-    for key, label in labels.items():
+    for key, fallback in fallback_labels.items():
         primary_key, ids_key, fallback_key = env_keys[key]
         cid = _int_env(primary_key) or (_int_env(fallback_key) if fallback_key else None)
         if not cid:
             continue
+        entry = _column_tree_entry(cid, tree)
+        title = (entry.get("title") or fallback).strip() if entry else fallback
         extra = _int_list_env(ids_key)
         column_ids = list(dict.fromkeys(extra + _expand_column_ids(cid, tree)))
         move_override = _int_env("KAITEN_COL_WIP_MOVE") if key == "wip" else None
@@ -533,7 +600,7 @@ def board_column_config() -> dict[str, dict[str, Any]]:
             "column_id": move_id,
             "parent_column_id": cid,
             "column_ids": column_ids,
-            "title": label,
+            "title": title,
         }
     return out
 
@@ -604,6 +671,19 @@ def list_active_cards(
         },
         ["get_card", "list_cards"],
     )
+
+
+def card_assigned_to_user(card: dict, kaiten_user_id: int) -> bool:
+    """Карточка «моя»: ответственный (type=2) или владелец, если ответственный не назначен."""
+    responsible = card.get("responsible_user_ids") or []
+    if responsible:
+        return int(kaiten_user_id) in {int(x) for x in responsible}
+    owner_id = card.get("owner_id")
+    return owner_id is not None and int(owner_id) == int(kaiten_user_id)
+
+
+def filter_cards_for_user(cards: list[dict], kaiten_user_id: int) -> list[dict]:
+    return [c for c in cards if card_assigned_to_user(c, kaiten_user_id)]
 
 
 def list_overdue() -> dict:
